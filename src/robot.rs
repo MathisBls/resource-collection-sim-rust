@@ -65,11 +65,11 @@ fn scout_tick(
     tx: &Sender<Message>,
     rng: &mut impl Rng,
 ) {
-    let known_obstacles = knowledge.read().unwrap().obstacles.clone();
+    let known_obstacles = knowledge.read().unwrap_or_else(|e| e.into_inner()).obstacles.clone();
 
     let mut msgs = Vec::new();
     {
-        let mut w = world.lock().unwrap();
+        let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
         sense(&w, st.pos, &mut msgs);
 
         // Exploration avec élan : continue dans la direction courante tant
@@ -77,7 +77,8 @@ fn scout_tick(
         // libre au hasard. Couvre beaucoup plus de terrain qu'une marche
         // purement aléatoire et pousse les éclaireurs vers les bords.
         let ahead = Pos::new(st.pos.x + st.dir.0, st.pos.y + st.dir.1);
-        let walkable = |p: Pos| !w.is_obstacle(p) && !known_obstacles.contains(&p);
+        let walkable =
+            |p: Pos| !w.is_obstacle(p) && !known_obstacles.contains(&p) && !w.is_occupied(p, st.id);
         // 15 % du temps on change quand même de cap, pour ne pas longer
         // indéfiniment un même couloir.
         if walkable(ahead) && rng.gen_bool(0.85) {
@@ -93,7 +94,10 @@ fn scout_tick(
                 // réellement libres pour ne pas rester figé.
                 choices = dirs
                     .into_iter()
-                    .filter(|&(dx, dy)| !w.is_obstacle(Pos::new(st.pos.x + dx, st.pos.y + dy)))
+                    .filter(|&(dx, dy)| {
+                        let p = Pos::new(st.pos.x + dx, st.pos.y + dy);
+                        !w.is_obstacle(p) && !w.is_occupied(p, st.id)
+                    })
                     .collect();
             }
             if let Some(&d) = choices.choose(rng) {
@@ -122,7 +126,7 @@ fn collector_tick(
 
     // --- Phase lecture : connaissance partagée -----------------------------
     let obstacles = {
-        let k = knowledge.read().unwrap();
+        let k = knowledge.read().unwrap_or_else(|e| e.into_inner());
 
         // Invalide la cible si elle a disparu ou a été prise par un autre.
         if let Some(t) = st.target {
@@ -145,44 +149,28 @@ fn collector_tick(
         k.obstacles.clone()
     };
 
-    let base = world.lock().unwrap().base;
-    let blocked = |p: Pos| obstacles.contains(&p);
-
-    let goal = if st.carrying.is_some() {
-        Some(base)
-    } else {
-        st.target
-    };
+    let base = world.lock().unwrap_or_else(|e| e.into_inner()).base;
 
     // --- Phase action : agit sur le monde ----------------------------------
     {
-        let mut w = world.lock().unwrap();
-
-        let next = goal.and_then(|g| {
-            if st.pos == g {
-                None
-            } else {
-                path::next_step(st.pos, g, w.width, w.height, &blocked)
-                    .or_else(|| greedy_step(st.pos, g, &w, &obstacles))
-            }
-        });
+        let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
 
         if st.carrying.is_some() {
             if st.pos == base {
                 let kind = st.carrying.take().unwrap();
                 msgs.push(Message::Collected { kind, amount: 1 });
             } else {
-                step_or_report(&w, &mut st.pos, next, &mut msgs, rng);
+                advance(&w, st.id, &mut st.pos, base, &obstacles, &mut msgs, rng);
             }
         } else if let Some(t) = st.target {
             if st.pos == t {
                 collect_here(&mut w, t, st, &mut msgs);
             } else {
-                step_or_report(&w, &mut st.pos, next, &mut msgs, rng);
+                advance(&w, st.id, &mut st.pos, t, &obstacles, &mut msgs, rng);
             }
         } else {
             // Rien de connu : exploration aléatoire.
-            if let Some(np) = random_walk(&w, st.pos, rng) {
+            if let Some(np) = random_walk(&w, st.id, st.pos, rng) {
                 st.pos = np;
             }
         }
@@ -226,22 +214,36 @@ fn collect_here(w: &mut World, t: Pos, st: &mut State, msgs: &mut Vec<Message>) 
     }
 }
 
-/// Avance d'un pas, ou signale un obstacle non découvert et ne bouge pas.
-fn step_or_report(
+/// Avance d'un pas vers `goal` en suivant le BFS sur les obstacles connus. Si le
+/// pas idéal est un obstacle non encore découvert, on le signale (apprentissage)
+/// et on ne s'y engage pas. S'il est occupé par un autre robot, on contourne
+/// vers le but (voisin libre le plus proche de `goal`), avec un pas de côté
+/// aléatoire en dernier recours : cela évite à la fois les superpositions et les
+/// blocages tête-à-tête, sans faire dériver le robot loin de sa destination.
+fn advance(
     w: &World,
+    id: usize,
     pos: &mut Pos,
-    next: Option<Pos>,
+    goal: Pos,
+    obstacles: &std::collections::HashSet<Pos>,
     msgs: &mut Vec<Message>,
     rng: &mut impl Rng,
 ) {
-    match next {
-        Some(np) if !w.is_obstacle(np) => *pos = np,
-        Some(np) => msgs.push(Message::FoundObstacle { pos: np }),
-        None => {
-            if let Some(np) = random_walk(w, *pos, rng) {
-                *pos = np;
-            }
+    let bfs_next = path::next_step(*pos, goal, w.width, w.height, &|p| obstacles.contains(&p));
+
+    if let Some(np) = bfs_next {
+        if w.is_obstacle(np) {
+            msgs.push(Message::FoundObstacle { pos: np });
         }
+    }
+
+    let step = match bfs_next {
+        Some(np) if !w.is_obstacle(np) && !w.is_occupied(np, id) => Some(np),
+        _ => greedy_step(*pos, goal, id, w, obstacles).or_else(|| random_walk(w, id, *pos, rng)),
+    };
+
+    if let Some(np) = step {
+        *pos = np;
     }
 }
 
@@ -264,18 +266,26 @@ fn sense(w: &World, pos: Pos, msgs: &mut Vec<Message>) {
 }
 
 /// Voisin franchissable qui rapproche le plus du but (repli si le BFS échoue).
-fn greedy_step(from: Pos, goal: Pos, w: &World, obstacles: &std::collections::HashSet<Pos>) -> Option<Pos> {
+fn greedy_step(
+    from: Pos,
+    goal: Pos,
+    id: usize,
+    w: &World,
+    obstacles: &std::collections::HashSet<Pos>,
+) -> Option<Pos> {
     from.neighbors4()
         .into_iter()
-        .filter(|&p| w.in_bounds(p) && !w.is_obstacle(p) && !obstacles.contains(&p))
+        .filter(|&p| {
+            w.in_bounds(p) && !w.is_obstacle(p) && !obstacles.contains(&p) && !w.is_occupied(p, id)
+        })
         .min_by_key(|&p| p.manhattan(goal))
 }
 
-fn random_walk(w: &World, pos: Pos, rng: &mut impl Rng) -> Option<Pos> {
+fn random_walk(w: &World, id: usize, pos: Pos, rng: &mut impl Rng) -> Option<Pos> {
     let options: Vec<Pos> = pos
         .neighbors4()
         .into_iter()
-        .filter(|&p| !w.is_obstacle(p))
+        .filter(|&p| !w.is_obstacle(p) && !w.is_occupied(p, id))
         .collect();
     options.choose(rng).copied()
 }

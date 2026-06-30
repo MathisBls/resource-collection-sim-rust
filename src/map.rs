@@ -29,6 +29,7 @@ pub struct RobotView {
     pub carrying: Option<ResourceKind>,
 }
 
+#[derive(Clone)]
 pub struct World {
     pub width: i32,
     pub height: i32,
@@ -56,6 +57,18 @@ impl World {
     /// Un obstacle réel : hors carte ou tuile bloquée.
     pub fn is_obstacle(&self, p: Pos) -> bool {
         !self.in_bounds(p) || self.tile(p) == Tile::Obstacle
+    }
+
+    /// Vrai si un autre robot occupe déjà la case `p`. La base est exemptée :
+    /// c'est le point de ralliement, plusieurs robots peuvent s'y trouver.
+    pub fn is_occupied(&self, p: Pos, ignore_id: usize) -> bool {
+        if p == self.base {
+            return false;
+        }
+        self.robots
+            .iter()
+            .enumerate()
+            .any(|(i, r)| i != ignore_id && r.pos == p)
     }
 
     /// Génère une carte : obstacles via Perlin, base au centre,

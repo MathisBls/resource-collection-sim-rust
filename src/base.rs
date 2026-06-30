@@ -28,7 +28,7 @@ pub fn run_base(
 
         match msg {
             Message::FoundResource { pos, kind, qty } => {
-                let mut k = knowledge.write().unwrap();
+                let mut k = knowledge.write().unwrap_or_else(|e| e.into_inner());
                 k.obstacles.remove(&pos);
                 let entry = k.resources.entry(pos).or_insert(KnownResource {
                     kind,
@@ -43,11 +43,11 @@ pub fn run_base(
                 }
             }
             Message::FoundObstacle { pos } => {
-                let mut k = knowledge.write().unwrap();
+                let mut k = knowledge.write().unwrap_or_else(|e| e.into_inner());
                 k.obstacles.insert(pos);
             }
             Message::Claim { id, pos } => {
-                let mut k = knowledge.write().unwrap();
+                let mut k = knowledge.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(r) = k.resources.get_mut(&pos) {
                     if r.claimed_by.is_none() {
                         r.claimed_by = Some(id);
@@ -55,7 +55,7 @@ pub fn run_base(
                 }
             }
             Message::Deplete { pos } => {
-                let mut k = knowledge.write().unwrap();
+                let mut k = knowledge.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(r) = k.resources.get_mut(&pos) {
                     r.depleted = true;
                     r.qty = 0;
@@ -63,7 +63,7 @@ pub fn run_base(
                 }
             }
             Message::Collected { kind, amount } => {
-                let mut w = world.lock().unwrap();
+                let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
                 match kind {
                     ResourceKind::Energy => w.collected_energy += amount,
                     ResourceKind::Crystal => w.collected_crystals += amount,

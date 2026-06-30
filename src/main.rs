@@ -91,7 +91,7 @@ fn main() -> io::Result<()> {
     }
 
     // Résumé final.
-    let w = world.lock().unwrap();
+    let w = world.lock().unwrap_or_else(|e| e.into_inner());
     println!(
         "Simulation terminée — Énergie collectée : {} | Cristaux collectés : {}",
         w.collected_energy, w.collected_crystals
@@ -106,10 +106,10 @@ fn run_ui(
     running: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     while running.load(Ordering::Relaxed) {
-        {
-            let w = world.lock().unwrap();
-            terminal.draw(|f| ui::draw(f, &w))?;
-        }
+        // Instantané sous verrou (rapide), puis rendu hors verrou : l'affichage
+        // ne bloque jamais les threads robots, même sur un terminal lent.
+        let snapshot = world.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        terminal.draw(|f| ui::draw(f, &snapshot))?;
 
         // Toute pression de touche quitte.
         if event::poll(Duration::from_millis(50))? {
